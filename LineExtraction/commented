@@ -1,0 +1,1752 @@
+/*
+typedef Eigen::Matrix<t_lineVector, Eigen::Dynamic, Eigen::Dynamic> t_LineDataSet;
+
+template<class P>
+struct DataSetBuilder : parallel_process<DataSetBuilder<P>>{
+typedef struct RowState{
+t_lineVector  _lines;
+t_pointVector _points;
+size_t        _row;
+size_t        _col;
+t_uchar*      _buffer_ptr;
+t_uchar*      _pixel_ptr;
+size_t        _components_sum;
+}RowState;
+
+template<typename T>
+bool operator()(const size_t threads,
+T wait_timer,
+t_LineDataSet& out_lines){
+this->start(threads);
+this->wait(wait_timer);
+out_lines = move(_data_set);
+return true;
+}
+
+inline bool done(){
+_buffer_mutex.lock();
+size_t offset = _buffer_offset;
+_buffer_mutex.unlock();
+return offset + _buffer_length >= _image->Pixels.size();
+}
+
+void worker(){
+//cout << endl;
+RowState state;
+_buffer_mutex.lock();
+size_t offset = _buffer_offset;
+_buffer_offset += _buffer_length;
+state._row = _processed_row;
+_processed_row++;
+_buffer_mutex.unlock();
+if (offset + _buffer_length >= _image->Pixels.size()) return;
+for (size_t i=0; i <= _bytes_per_row - _buffer_chunk_length; i += _buffer_chunk_length) {
+state._buffer_ptr = &_image->Pixels[i+offset];
+for (size_t y=0; y<_kernel_size; y++) {
+state._pixel_ptr = state._buffer_ptr;
+for (size_t x=0; x<_kernel_size; x++) {
+P pixel(state._pixel_ptr);
+state._components_sum = pixel.red;
+state._components_sum += pixel.green;
+state._components_sum += pixel.blue;
+
+if (state._components_sum < _pixel_threshold){
+state._points.push_back(t_point2d{static_cast<float_t>(x),static_cast<float_t>(y)});
+//cout << "X ";
+}//else
+//cout << ". ";
+state._pixel_ptr += _bytes_per_pixel;
+}
+state._buffer_ptr += _bytes_per_row;
+//cout << endl;
+}
+
+size_t psize = state._points.size();
+size_t i_per = 0, j_per = 0;
+//cout << psize << endl;
+if (psize > _min_density_threshold &&
+psize < _max_density_threshold){
+for_permutation(i_per, j_per, psize){
+if (i_per != j_per ){
+if (state._points[i_per].lengthBetween(state._points[j_per]) > _line_length_threshold){
+t_line2d l{
+state._points[i_per],
+state._points[j_per],
+t_region{state._row,state._col},
+0.0f,
+0.0f
+};
+//cout << "line " << endl;
+cout << l.slope << " " << l.length() << " " << l.p1 << l.p2 << endl;
+state._lines.push_back(l);
+}
+}
+}
+//cout << "FOUND " << state._lines.size() << endl;
+_data_set_mutex.lock();
+_data_set(state._row, state._col) = move(state._lines);
+_data_set_mutex.unlock();
+state._lines.clear();
+}
+if (this->shouldStop()){
+return;
+}
+state._points.clear();
+state._col++;
+}
+}
+public:
+DataSetBuilder(shared_ptr<Image> image,
+const size_t kernel_size,
+float_t  line_length_threshold,
+float_t  min_density_threshold,
+float_t  max_density_threshold,
+size_t   pixel_threshold):
+_image(image),
+_kernel_size(kernel_size),
+_processed_row(0),
+parallel_process<DataSetBuilder<P>>(bind(&DataSetBuilder<P>::worker,ref(*this)),
+bind(&DataSetBuilder<P>::done,ref(*this))){
+_buffer_chunk_length = _kernel_size*_image->BytesPerPixel;
+_buffer_length = _image->BytesPerRow*_kernel_size;
+_bytes_per_pixel = _image->BytesPerPixel;
+_bytes_per_row = _image->BytesPerRow;
+_buffer_offset = 0;
+_line_length_threshold = line_length_threshold;
+_min_density_threshold = min_density_threshold;
+_max_density_threshold = max_density_threshold;
+_pixel_threshold  = pixel_threshold;
+_data_set.resize(_image->Height/_kernel_size,
+_image->Width/_kernel_size);
+}
+private:
+mutex                   _buffer_mutex;
+mutex                   _data_set_mutex;
+shared_ptr<Image>       _image;
+Eigen::Matrix<t_lineVector, Eigen::Dynamic, Eigen::Dynamic>           _data_set;
+size_t                  _processed_row;
+size_t                  _kernel_size;
+size_t                  _buffer_offset;
+size_t                  _buffer_length;
+size_t                  _buffer_chunk_length;
+size_t                  _bytes_per_pixel;
+size_t                  _bytes_per_row;
+size_t                  _pixel_threshold;
+size_t                  _min_density_threshold;
+size_t                  _max_density_threshold;
+float_t                 _line_length_threshold;
+};
+*/
+
+
+
+//////////////////
+
+
+
+template<typename P>
+struct line2D_extractor : ParallelProcess<line2D_extractor<P>>{
+//typedef unordered_map<typename t_point2d::hierarchical_distance_type, float_t>  frequencyMap;
+//typedef vector<pair<typename t_point2d::hierarchical_distance_type,float_t>>    t_frequencyVector;
+typedef vector<pair<float, vector<size_t>>>                                       t_agghClusterIndexes;
+bool done(){
+bufferOffsetAndRowMutex.lock();
+size_t offset = bufferOffset;
+bufferOffsetAndRowMutex.unlock();
+return offset + bufferLength >= pixels.size();
+}
+
+/// NOTE : TOLERANCE TO LINE MARGIN IS KERNEL!
+void worker(){
+bufferOffsetAndRowMutex.lock();
+size_t offset = bufferOffset;
+bufferOffset += bufferLength;
+size_t row = processedRow;
+++processedRow;
+bufferOffsetAndRowMutex.unlock();
+
+if ( offset + bufferLength >= pixels.size() ) { return; }
+
+/// extract lines from pixels using clustering algorithm
+t_pointVector                 points;
+//vector<t_point2d>   validPoints;
+//vector<t_point2d>   linePoints;
+t_indexVector                 mergedIndexes;
+t_lineVector                  validLines;
+t_lineVector                  clusterLines;
+t_agghClusterIndexes          clusterIndexes;
+t_agghClusterVector           clusterVector;
+//typedef pair<typename t_line2d::hierarchical_distance_type, vector<size_t>>         clusterElement;
+//typedef vector<clusterElement> cluster;
+//typedef vector<pair<float_t, typename cluster::iterator>> clusterFrequencies;
+//cluster clusters;
+//clusterFrequencies  cFrequencies;
+unsigned char* ptr = NULL;
+unsigned char* pixelptr = NULL;
+size_t  components_sum = 0xFFFFFF;
+//cluster clusters;
+//cluster rawLines;
+//t_frequencyVector     freqVector;
+/// TODO get column and row... to add smaller lines
+size_t column = 0;
+//// USE STRUCTS TO HELP OPTIMIZER?
+size_t i_per = 0;
+size_t j_per = 0;
+for (size_t i=0; i < bytesPerRow - bufferChunkLength; i += bufferChunkLength) {
+//cout << " ROW : " << row << " COLUMN " << column << endl;
+
+ptr = &pixels[i+offset];
+
+for (size_t y=0; y<ks; y++) {
+pixelptr = ptr;//+(y*bytesPerRow);
+for(size_t x=0; x<ks ;x++){
+P pixel(pixelptr);
+//cout << (int)pixel.red << " " << (int)pixel.green << " " << (int) pixel.blue << endl;
+
+components_sum = pixel.red;
+components_sum += pixel.green;
+components_sum += pixel.blue;
+
+//cout << components_sum << endl;
+if ( components_sum < pixelThreshold ){
+points.push_back(
+t_point2d{
+x,
+y
+});
+//cout << " x ";
+}//else
+//cout << " . ";
+
+pixelptr += bytesPerPixel;
+}
+ptr += bytesPerRow;
+//cout << endl;
+}
+/// optimize using priority queue?
+/// Find farthest points instead of sorting them
+//cout << points.size() << endl;
+
+if ( points.size() > minDensityThreshold &&
+points.size() < maxDensityThreshold){
+for_permutation( i_per, j_per, points.size() ){
+if ( i_per != j_per ){
+if (points[i_per].lengthBetween(points[j_per]) > lineLengthThreshold ){
+
+t_line2d l(
+points[i_per],
+points[j_per],
+t_region{row,column},
+0.0f,
+0.0f);
+
+validLines.push_back(l);
+}
+}
+}
+
+i_per = 0;
+j_per = 0;
+
+//cout << " CLUSTERING " << validLines.size() << " LINES " << endl;
+
+if ( validLines.size() > 1 ) {
+
+AgglomerativeHierarchical<t_lineVector,typename t_line2d::difference_distance_operator, SingleLinkage<t_line2d::difference_distance_operator>> aggh(validLines.begin(),
+validLines.end());
+
+t_indexVector c;
+typename t_line2d::difference_distance_operator::distance_type linkage;
+while (aggh.nextClusters()) {
+aggh.currentClusterIndexes(move(c));
+aggh.currentClusterDistance(linkage);
+
+cout << linkage << endl;
+
+if (clusterIndexes.size()){
+mergedIndexes = move(c = clusterIndexes[clusterIndexes.size()-1].second);
+}else{
+mergedIndexes = move(c);
+}
+
+for (t_indexVector::iterator i = mergedIndexes.begin(); i!= mergedIndexes.end(); i++) {
+//              validLines[*i].endpoint1.x += column*ks;
+//              validLines[*i].endpoint1.y += row*ks;
+//              validLines[*i].endpoint2.x += column*ks;
+//              validLines[*i].endpoint2.y += row*ks;
+clusterLines.push_back(validLines[*i]);
+}
+if (clusterLines.size()){
+clusterVector.push_back(make_pair(linkage, move(clusterLines)));
+}
+
+clusterLines.clear();
+mergedIndexes.clear();
+}
+
+/*
+AGGH<vector<t_line2d>, typename t_line2d::SingleLinkage>(validLines.begin(), validLines.end(),[&]( std::vector<size_t>& c,Eigen::Matrix<float,Eigen::Dynamic,Eigen::Dynamic>& m, typename t_line2d::hierarchical_distance_type linkage){
+cout << linkage << endl;
+if (clusterIndexes.size() > 1) {
+mergedIndexes = move(c-clusterIndexes[clusterIndexes.size()-1].second);
+}else{
+mergedIndexes = move(c);
+}
+
+for (t_indexVector::iterator i = mergedIndexes.begin(); i!= mergedIndexes.end(); i++) {
+//              validLines[*i].endpoint1.x += column*ks;
+//              validLines[*i].endpoint1.y += row*ks;
+//              validLines[*i].endpoint2.x += column*ks;
+//              validLines[*i].endpoint2.y += row*ks;
+clusterLines.push_back(validLines[*i]);
+}
+
+if (clusterLines.size()){
+clusterVector.push_back(make_pair(linkage, move(clusterLines)));
+}
+
+clusterLines.clear();
+mergedIndexes.clear();
+});
+*/
+}
+
+linesMutex.lock();
+imageLines(row,column) = move(clusterVector);
+linesMutex.unlock();
+
+clusterIndexes.clear();
+validLines.clear();
+}
+
+clusterVector.clear();
+
+//validPoints.clear();
+//cout << endl;
+
+points.clear();
+
+column++;
+}
+
+this_thread::yield();
+}
+
+explicit line2D_extractor(const size_t kernelSize,
+shared_ptr<Image> imagePtr,
+const size_t threshold):
+pixels(imagePtr->Pixels),
+pixelThreshold(threshold){
+//bufferOffset.store(0,memory_order_relaxed);
+/// can hardcode this
+ks = kernelSize;
+kl = ks*ks;
+bufferOffset = 0;
+/// Can use width instead of bytesperrow
+bufferLength = imagePtr->BytesPerRow*ks;
+cout << "BUFFERLENGTH : " << bufferLength << endl;
+bytesPerRow = imagePtr->BytesPerRow;
+cout << "BYTESPERROW : " << bytesPerRow << endl;
+bytesPerPixel = imagePtr->BytesPerPixel;
+bufferChunkLength = /*bytesPerRow/*/(bytesPerPixel*ks);
+cout << "BUFFERCHUNKLENGTH : " << bufferChunkLength << endl;
+bufferCroppedLength = bytesPerRow%(bytesPerPixel*ks);
+cout << "CROPPEDLENGTH : " << bufferCroppedLength << endl;
+processedRow = 0;
+imageRows = imagePtr->Height/ks;
+imageColumns = imagePtr->BytesPerRow/ks;
+imageLines.resize(imageRows, imageColumns);
+//imageClusters.resize(imageRows, imageColumns);
+imageWidth = imagePtr->Width;
+imageColumns = imagePtr->Height;
+cout << " BUFFER CHUNK LENGTH IS : " << bufferChunkLength << " and bpp " << bytesPerPixel << endl;
+}
+line2D_extractor(const line2D_extractor& other)=default;
+~line2D_extractor() = default;
+
+public:
+//private:
+/// Units pixels
+mutex               bufferOffsetAndRowMutex;
+mutex               linesMutex;     //// TODO remove mutex - use lock free stack/queue to store lines and benchmark
+//mutex               clusterMutex;
+float_t             lineLengthThreshold;
+size_t              bufferOffset;
+size_t              bufferLength;
+size_t              bufferChunkLength;
+size_t              bufferCroppedLength;
+size_t              bytesPerRow;
+size_t              bytesPerPixel;
+size_t              processedRow;
+size_t              ks;
+size_t              kl;
+size_t              pixelThreshold;
+size_t              minDensityThreshold;
+size_t              maxDensityThreshold;
+size_t              imageRows;
+size_t              imageColumns;
+size_t              imageWidth;
+size_t              imageHeight;
+typedef unsigned char uchar;
+vector<uchar>&      pixels;
+//vector<cluster>     rawLines;
+//clusterMatrix       imageClusters;
+t_agghLineMatrix    imageLines;
+};
+
+
+
+//////////////////
+
+
+
+template<class D,class... Args>
+struct ParallelProcess {
+protected:
+bool shouldStop(){
+lock_guard<mutex> lock(stoppedMutex);
+return stopped;
+}
+bool start(const size_t threads,
+Args... args){
+if (threads > GetCPUCount()) return false;
+/// TODO protect
+static function<void()> active_func = [&](){
+static_cast<D*>(this)->worker(args...);
+if (!static_cast<D*>(this)->done()){
+thread t(active_func);
+t.detach();
+threadVector.push_back(thread());
+threadVector.back().swap(t);
+}else{
+stop();
+}
+};
+for (int i=0;i<threads;i++){
+if (!shouldStop()){
+thread t(active_func,args...);t.detach();
+threadVector.push_back(thread());
+threadVector.back().swap(t);
+}
+}
+
+return true;
+}
+
+public:
+void stop(){
+stopped = true;
+waitCondition.notify_all();
+for (size_t i=0; i<threadVector.size();i++){
+if (threadVector[i].joinable()){
+threadVector[i].join();
+}
+}
+}
+template<class T>
+std::cv_status wait(T t){
+unique_lock<mutex> ul(waitMutex);
+return waitCondition.wait_for(ul, t);
+}
+explicit ParallelProcess(){}
+/// TODO store threads and stop at timeout
+protected:
+vector<thread>                              threadVector;
+condition_variable                          waitCondition;
+mutex                                       waitMutex;
+mutex                                       stoppedMutex;
+bool                                        stopped;
+};
+
+/////////
+
+
+
+class LineDetectorAgglomerative {
+public:
+typedef Eigen::Matrix<t_lineVector, Eigen::Dynamic, Eigen::Dynamic>     t_ClusteringDataSet;
+typedef unsigned char t_uchar;
+template<typename P>
+struct DataSetBuilder : public ParallelProcess<DataSetBuilder<P>>{
+
+typedef struct RowState{
+t_lineVector  _lines;
+t_pointVector _points;
+size_t        _row;
+size_t        _col;
+t_uchar*      _buffer_ptr;
+t_uchar*      _pixel_ptr;
+size_t        _components_sum;
+}RowState;
+
+template<typename T>
+t_ClusteringDataSet operator()(const size_t threads,
+T wait_timer){
+this->start(threads);
+this->wait(wait_timer);
+return move(_data_set);
+}
+
+inline bool done(){
+_buffer_mutex.lock();
+size_t offset = _buffer_offset;
+_buffer_mutex.unlock();
+return offset + _buffer_length >= _image->Pixels.size();
+}
+
+void worker(){
+//cout << endl;
+RowState state;
+_buffer_mutex.lock();
+size_t offset = _buffer_offset;
+_buffer_offset += _buffer_length;
+state._row = _processed_row;
+_processed_row++;
+_buffer_mutex.unlock();
+if (offset + _buffer_length >= _image->Pixels.size()) return;
+for (size_t i=0; i <= _bytes_per_row - _buffer_chunk_length; i += _buffer_chunk_length) {
+state._buffer_ptr = &_image->Pixels[i+offset];
+for (size_t y=0; y<_kernel_size; y++) {
+state._pixel_ptr = state._buffer_ptr;
+for (size_t x=0; x<_kernel_size; x++) {
+P pixel(state._pixel_ptr);
+state._components_sum = pixel.red;
+state._components_sum += pixel.green;
+state._components_sum += pixel.blue;
+
+if (state._components_sum < _pixel_threshold){
+state._points.push_back(t_point2d{x,y});
+//cout << "X ";
+}//else
+//cout << ". ";
+state._pixel_ptr += _bytes_per_pixel;
+}
+state._buffer_ptr += _bytes_per_row;
+//cout << endl;
+}
+
+size_t psize = state._points.size();
+size_t i_per = 0, j_per = 0;
+//cout << psize << endl;
+if (psize > _min_density_threshold &&
+psize < _max_density_threshold){
+for_permutation(i_per, j_per, psize){
+if (i_per != j_per ){
+if (state._points[i_per].lengthBetween(state._points[j_per]) > _line_length_threshold){
+t_line2d l{
+state._points[i_per],
+state._points[j_per],
+t_region{state._row,state._col},
+0.0f,
+0.0f
+};
+//cout << "line " << endl;
+cout << l.slope << " " << l.length() << " " << l.endpoint1 << l.endpoint2 << endl;
+state._lines.push_back(l);
+}
+}
+}
+cout << "FOUND " << state._lines.size() << endl;
+_data_set_mutex.lock();
+_data_set(state._row, state._col) = move(state._lines);
+_data_set_mutex.unlock();
+state._lines.clear();
+}
+if (this->shouldStop()){
+return;
+}
+state._points.clear();
+state._col++;
+}
+}
+public:
+DataSetBuilder(shared_ptr<Image> image,
+const size_t kernel_size,
+float_t  line_length_threshold,
+float_t  min_density_threshold,
+float_t  max_density_threshold,
+size_t   pixel_threshold):
+_image(image),
+_kernel_size(kernel_size),
+_processed_row(0){
+_buffer_chunk_length = _kernel_size*_image->BytesPerPixel;
+_buffer_length = _image->BytesPerRow*_kernel_size;
+_bytes_per_pixel = _image->BytesPerPixel;
+_bytes_per_row = _image->BytesPerRow;
+_buffer_offset = 0;
+_line_length_threshold = line_length_threshold;
+_min_density_threshold = min_density_threshold;
+_max_density_threshold = max_density_threshold;
+_pixel_threshold  = pixel_threshold;
+_data_set.resize(_image->Height/_kernel_size,
+_image->Width/_kernel_size);
+}
+private:
+mutex                   _buffer_mutex;
+mutex                   _data_set_mutex;
+shared_ptr<Image>       _image;
+t_ClusteringDataSet     _data_set;
+size_t                  _processed_row;
+size_t                  _kernel_size;
+size_t                  _buffer_offset;
+size_t                  _buffer_length;
+size_t                  _buffer_chunk_length;
+size_t                  _bytes_per_pixel;
+size_t                  _bytes_per_row;
+size_t                  _pixel_threshold;
+size_t                  _min_density_threshold;
+size_t                  _max_density_threshold;
+float_t                 _line_length_threshold;
+};
+
+class LineSegmentClustering : public ParallelProcess<LineSegmentClustering>{
+mutex                   _processedRowMutex;
+t_ClusteringDataSet*    _outDataSet;
+t_ClusteringDataSet*    _inDataSet;
+size_t                  _outRows;
+size_t                  _outCols;
+size_t                  _inRows;
+size_t                  _inCols;
+size_t                  _processedRow;
+const size_t            _kernelSize;
+public:
+
+template<typename T>
+void operator()(const size_t threads,
+T wait_timer){
+this->start(threads);
+this->wait(wait_timer);
+}
+
+bool done(){
+_processedRowMutex.lock();
+size_t row = _processedRow;
+_processedRowMutex.unlock();
+return row + _kernelSize > _inRows;
+}
+
+void worker(){
+_processedRowMutex.lock();
+size_t row = _processedRow;
+_processedRow += _kernelSize;
+_processedRowMutex.unlock();
+if (row + _kernelSize > _inRows) return;
+
+t_lineVector  _kernelLines;
+t_ClusteringDataSet&  _data = *_inDataSet;
+//t_lineVector* _klp;
+for (size_t i=0; i + _kernelSize < _inCols; i += _kernelSize) {
+cout << "X" ;
+_kernelLines.insert(_kernelLines.end(), _data(row,i).begin(), _data(row,i).end());
+//        copy( _data(row,i).begin(), _data(row,i).end() , _kernelLines.end());
+_kernelLines.insert(_kernelLines.end(), _data(row,i+1).begin(),_data(row,i+1).end());
+//        copy( _data(row,i+1).begin(), _data(row,i+1).end() , _kernelLines.end());
+_kernelLines.insert(_kernelLines.end(), _data(row,i+2).begin(),_data(row,i+2).end());
+//        copy( _data(row,i+2).begin(), _data(row,i+2).end() , _kernelLines.end());
+
+_kernelLines.insert(_kernelLines.end(), _data(row+1,i).begin(),_data(row+1,i).end());
+//        copy( _data(row+1,i).begin(), _data(row+1,i).end() , _kernelLines.end());
+_kernelLines.insert(_kernelLines.end(), _data(row+1,i+1).begin(),_data(row+1,i+1).end());
+//        copy( _data(row+1,i+1).begin(), _data(row+1,i+1).end() , _kernelLines.end());
+_kernelLines.insert(_kernelLines.end(), _data(row+1,i+2).begin(), _data(row+1,i+2).end());
+//        copy( _data(row+1,i+2).begin(), _data(row+1,i+2).end() , _kernelLines.end());
+
+_kernelLines.insert(_kernelLines.end(), _data(row+2,i).begin(),_data(row+2,i).end());
+//        copy( _data(row+2,i).begin(), _data(row+2,i).end() , _kernelLines.end());
+_kernelLines.insert(_kernelLines.end(), _data(row+2,i+1).begin(),_data(row+2,i+1).end());
+//        copy( _data(row+2,i+1).begin(), _data(row+2,i+1).end() , _kernelLines.end());
+_kernelLines.insert(_kernelLines.end(), _data(row+2,i+2).begin(),_data(row+2,i+2).end());
+//        copy( _data(row+2,i+2).begin(), _data(row+2,i+2).end() , _kernelLines.end());
+
+for (size_t j=0; j<_kernelLines.size(); j++) {
+cout << "SLOPE " << _kernelLines[j].slope << endl;
+}
+
+cout << " GATHERED " << _kernelLines.size() << endl;
+
+if (_kernelLines.size()){
+AgglomerativeHierarchical<t_lineVector, t_line2d::colinear_distance_operator, ColinearLinkage<t_line2d::colinear_distance_operator>> aggh(_kernelLines.begin(),
+_kernelLines.end());
+
+t_line2d::colinear_distance_operator::distance_type distance;
+t_indexVector                                       cluster_indexes;
+
+while (aggh.nextClusters()) {
+aggh.currentClusterDistance(distance);
+aggh.currentClusterIndexes(move(cluster_indexes));
+
+cout << "AT DISTANCE " << distance << " " << cluster_indexes.size() << endl;
+
+for (size_t z=0;z<cluster_indexes.size();z++){
+cout << "S " << _kernelLines[cluster_indexes[z]] << endl;
+}
+
+}
+_kernelLines.clear();
+}
+}
+
+/*
+
+if (_kernelLines.size()){
+//// perform clustering on lines
+AgglomerativeHierarchical<t_lineVector,t_line2d::SingleLinkage> clustering(_kernelLines.begin(),
+_kernelLines.end());
+
+vector<pair<t_line2d::hierarchical_distance_type,t_indexVector>>    clusters;
+t_line2d::hierarchical_distance_type distance;
+t_indexVector cluster;
+while (clustering.nextClusters()) {
+/// do difference
+clustering.currentClusterDistance(distance);
+clustering.currentClusterIndexes(move(cluster));
+clusters.push_back(make_pair(distance,move(cluster)));
+}
+
+}
+*/
+//// Do gaussian distribution in data to find final lines
+
+}
+public:
+LineSegmentClustering(t_ClusteringDataSet* in_DataSet,
+t_ClusteringDataSet* out_DataSet):
+_outDataSet(out_DataSet),
+_inDataSet(in_DataSet),
+_kernelSize(3){
+_outRows = _inDataSet->rows()/3;
+_outCols = _inDataSet->cols()/3;
+cout << _outRows << endl << _outCols << endl;
+_inRows = _inDataSet->rows();
+_inCols = _inDataSet->cols();
+//_outRowsCropped = _outRows - _kernelSize/2;
+//_outColsCropped = _outCols - _kernelSize/2;
+_outDataSet->resize(_outRows, _outCols);
+}
+};
+
+private:
+/// exponential function
+//size_t                    _skip;
+t_lineVector              _lines;
+shared_ptr<Image>         _image;
+public:
+LineDetectorAgglomerative(shared_ptr<Image> image):
+_image(image){
+
+}
+};
+
+/////////////////
+
+
+
+
+
+
+template<typename P>
+struct line2D_extractor : ParallelProcessor<line2D_extractor<P>, function<void(line2D_extractor<P>&)>>{
+//typedef unordered_map<typename t_point2d::hierarchical_distance_type, float_t>  frequencyMap;
+//typedef vector<pair<typename t_point2d::hierarchical_distance_type,float_t>>    t_frequencyVector;
+typedef vector<pair<float, vector<size_t>>>                                       t_agghClusterIndexes;
+bool done(){
+bufferOffsetAndRowMutex.lock();
+size_t offset = bufferOffset;
+bufferOffsetAndRowMutex.unlock();
+return offset + bufferLength >= pixels.size();
+}
+
+/// NOTE : TOLERANCE TO LINE MARGIN IS KERNEL!
+void worker(){
+bufferOffsetAndRowMutex.lock();
+size_t offset = bufferOffset;
+bufferOffset += bufferLength;
+size_t row = processedRow;
+++processedRow;
+bufferOffsetAndRowMutex.unlock();
+
+if ( offset + bufferLength >= pixels.size() ) { return; }
+
+/// extract lines from pixels using clustering algorithm
+t_pointVector                 points;
+//vector<t_point2d>   validPoints;
+//vector<t_point2d>   linePoints;
+t_indexVector                 mergedIndexes;
+t_lineVector                  validLines;
+t_lineVector                  clusterLines;
+t_agghClusterIndexes          clusterIndexes;
+t_agghClusterVector           clusterVector;
+//typedef pair<typename t_line2d::hierarchical_distance_type, vector<size_t>>         clusterElement;
+//typedef vector<clusterElement> cluster;
+//typedef vector<pair<float_t, typename cluster::iterator>> clusterFrequencies;
+//cluster clusters;
+//clusterFrequencies  cFrequencies;
+unsigned char* ptr = NULL;
+unsigned char* pixelptr = NULL;
+size_t  components_sum = 0xFFFFFF;
+//cluster clusters;
+//cluster rawLines;
+//t_frequencyVector     freqVector;
+/// TODO get column and row... to add smaller lines
+size_t column = 0;
+//// USE STRUCTS TO HELP OPTIMIZER?
+size_t i_per = 0;
+size_t j_per = 0;
+for (size_t i=0; i < bytesPerRow - bufferChunkLength; i += bufferChunkLength) {
+//cout << " ROW : " << row << " COLUMN " << column << endl;
+
+ptr = &pixels[i+offset];
+
+for (size_t y=0; y<ks; y++) {
+pixelptr = ptr;//+(y*bytesPerRow);
+for(size_t x=0; x<ks ;x++){
+P pixel(pixelptr);
+//cout << (int)pixel.red << " " << (int)pixel.green << " " << (int) pixel.blue << endl;
+
+components_sum = pixel.red;
+components_sum += pixel.green;
+components_sum += pixel.blue;
+/*
+//cout << components_sum << endl;
+if ( components_sum < pixelThreshold ){
+points.push_back(
+t_point2d{
+static_cast<int>(x),
+static_cast<int>(y),
+static_cast<int>(x + column*ks),
+static_cast<int>(y + row*ks)
+});
+//cout << " x ";
+}//else
+//cout << " . ";
+*/
+pixelptr += bytesPerPixel;
+}
+ptr += bytesPerRow;
+//cout << endl;
+}
+/// optimize using priority queue?
+/// Find farthest points instead of sorting them
+//cout << points.size() << endl;
+/*
+if ( points.size() > minDensityThreshold &&
+points.size() < maxDensityThreshold){
+for_permutation( i_per, j_per, points.size() ){
+if ( i_per != j_per ){
+if (points[i_per].lengthBetween(points[j_per]) > lineLengthThreshold ){
+
+t_line2d l(
+points[i_per],
+points[j_per],
+t_region{row,column},
+0.0f,
+0.0f);
+
+validLines.push_back(l);
+}
+}
+}
+
+i_per = 0;
+j_per = 0;
+
+//cout << " CLUSTERING " << validLines.size() << " LINES " << endl;
+
+if ( validLines.size() > 1 ) {
+AGGH<vector<t_line2d>, typename t_line2d::SingleLinkage>(validLines.begin(), validLines.end(),[&]( std::vector<size_t>& c,Eigen::Matrix<float,Eigen::Dynamic,Eigen::Dynamic>& m, typename t_line2d::hierarchical_distance_type linkage){
+
+if (clusterIndexes.size() > 1) {
+mergedIndexes = move(c-clusterIndexes[clusterIndexes.size()-1].second);
+}else{
+mergedIndexes = move(c);
+}
+
+for (t_indexVector::iterator i = mergedIndexes.begin(); i!= mergedIndexes.end(); i++) {
+//              validLines[*i].endpoint1.x += column*ks;
+//              validLines[*i].endpoint1.y += row*ks;
+//              validLines[*i].endpoint2.x += column*ks;
+//              validLines[*i].endpoint2.y += row*ks;
+clusterLines.push_back(validLines[*i]);
+}
+
+if (clusterLines.size()){
+clusterVector.push_back(make_pair(linkage, move(clusterLines)));
+}
+
+clusterLines.clear();
+mergedIndexes.clear();
+});
+}
+
+linesMutex.lock();
+imageLines(row,column) = move(clusterVector);
+linesMutex.unlock();
+
+clusterIndexes.clear();
+validLines.clear();
+}
+
+clusterVector.clear();
+
+//validPoints.clear();
+//cout << endl;
+
+points.clear();
+*/
+column++;
+}
+
+this_thread::yield();
+}
+
+explicit line2D_extractor(const size_t kernelSize,
+shared_ptr<Image> imagePtr,
+const size_t threshold):
+pixels(imagePtr->Pixels),
+pixelThreshold(threshold){
+//bufferOffset.store(0,memory_order_relaxed);
+/// can hardcode this
+ks = kernelSize;
+kl = ks*ks;
+bufferOffset = 0;
+/// Can use width instead of bytesperrow
+bufferLength = imagePtr->BytesPerRow*ks;
+cout << "BUFFERLENGTH : " << bufferLength << endl;
+bytesPerRow = imagePtr->BytesPerRow;
+cout << "BYTESPERROW : " << bytesPerRow << endl;
+bytesPerPixel = imagePtr->BytesPerPixel;
+bufferChunkLength = /*bytesPerRow/*/(bytesPerPixel*ks);
+cout << "BUFFERCHUNKLENGTH : " << bufferChunkLength << endl;
+bufferCroppedLength = bytesPerRow%(bytesPerPixel*ks);
+cout << "CROPPEDLENGTH : " << bufferCroppedLength << endl;
+processedRow = 0;
+imageRows = imagePtr->Height/ks;
+imageColumns = imagePtr->BytesPerRow/ks;
+imageLines.resize(imageRows, imageColumns);
+//imageClusters.resize(imageRows, imageColumns);
+imageWidth = imagePtr->Width;
+imageColumns = imagePtr->Height;
+cout << " BUFFER CHUNK LENGTH IS : " << bufferChunkLength << " and bpp " << bytesPerPixel << endl;
+}
+line2D_extractor(const line2D_extractor& other)=default;
+~line2D_extractor() = default;
+
+public:
+//private:
+/// Units pixels
+mutex               bufferOffsetAndRowMutex;
+mutex               linesMutex;     //// TODO remove mutex - use lock free stack/queue to store lines and benchmark
+//mutex               clusterMutex;
+float_t             lineLengthThreshold;
+size_t              bufferOffset;
+size_t              bufferLength;
+size_t              bufferChunkLength;
+size_t              bufferCroppedLength;
+size_t              bytesPerRow;
+size_t              bytesPerPixel;
+size_t              processedRow;
+size_t              ks;
+size_t              kl;
+size_t              pixelThreshold;
+size_t              minDensityThreshold;
+size_t              maxDensityThreshold;
+size_t              imageRows;
+size_t              imageColumns;
+size_t              imageWidth;
+size_t              imageHeight;
+typedef unsigned char uchar;
+vector<uchar>&      pixels;
+//vector<cluster>     rawLines;
+//clusterMatrix       imageClusters;
+t_agghLineMatrix    imageLines;
+};
+
+
+-----------------------------------
+
+/*
+
+template<class C>
+float_t _domedian(C& container){
+size_t size = container.size();
+typename C::const_iterator i = container.begin();
+if ( size % 2 == 0 ){
+return (*(i +(size/2-1)) + *(i+(size/2)))/2;
+}else{
+return *(i+(size/2));
+}
+}
+
+//// TODO partial specialization
+template<class C>
+float_t median(C& container, const bool Sort = false){
+if (Sort){
+sort(container.begin(), container.end());
+}
+return _domedian(container);
+}
+
+struct point_compare{
+bool operator()(const t_point2d& p1, const t_point2d& p2){
+if (p1.x() < p2.x())
+return true;
+return false;
+}
+};
+
+//// TODO HAVE THEM SORTED WHILE ADDED IN THREADS
+//// OPTIMIZE THIS!!!!!
+template< template<class,class> class C>
+void theil_sen(C<t_point2d,allocator<t_point2d>>& container, float_t& slope, float_t& intercept, const bool Sort = true ){
+if ( Sort ){
+point_compare comp;
+sort(container.begin(),container.end(),comp);
+}
+
+typedef vector<t_point2d>::iterator container_iterator;
+float_t slope_value = 0.0f;
+if (slope == numeric_limits<float_t>::infinity() ){
+vector<float_t> slopes;
+for (container_iterator i = container.begin();i!=container.end()-1;i++){
+//slopes.push_back( (*i)-(*(i+1)) );
+}
+slope_value = median(slopes,true);
+}else{
+slope_value = slope;
+}
+vector<float_t> bs;
+for (container_iterator i = container.begin();i!=container.end();i++){
+bs.push_back(i->y() - (slope_value * i->x()));
+}
+intercept = median(bs);
+slope = slope_value;
+}
+
+*/
+
+
+--------------------------
+
+template<class P>
+class HoughLineDataSet : parallel_process<HoughLineDataSet<P>>{
+
+typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic>   t_Accumulator;
+
+typedef struct RowState{
+t_houghLineVector   _hlines;
+t_pointVector       _points;
+t_Accumulator       _accumulator;
+size_t              _row;
+size_t              _col;
+t_uchar*            _buffer_ptr;
+t_uchar*            _pixel_ptr;
+size_t              _components_sum;
+RowState(){
+_row = 0;
+_col = 0;
+_pixel_ptr = nullptr;
+_buffer_ptr = nullptr;
+}
+}RowState;
+
+inline bool done(){
+_buffer_mutex.lock();
+size_t offset = _buffer_offset;
+_buffer_mutex.unlock();
+return offset + _buffer_length >= _image->Pixels.size();
+}
+
+inline void houghLines(t_pointVector& points,
+t_Accumulator& accumulator){
+//size_t csum, x = 0 , y = 0;
+float center_x = _kernel_size*0.5;//image->Width*0.5;
+float center_y = _kernel_size*0.5;//image->Height*0.5;
+
+float hough_h = ((sqrt(2.0) * (float)(_kernel_size)) / 2.0),
+_accu_h = round(hough_h * 2.0), // -r -> +r
+_accu_w = 180;
+
+accumulator.resize(_accu_h+1, _accu_w);
+accumulator.setConstant(0);
+
+for (t_pointVector::iterator i = points.begin();
+i != points.end();
+i++) {
+for(int t=0;t<180;t+=1)
+{
+double r = ( ((float)i->x() - center_x) * cos((float)t * DEG2RAD)) + (((float)i->y() - center_y) * sin((float)t * DEG2RAD));
+accumulator(round(r+hough_h),t)++;
+}
+}
+}
+/*
+merge lines with same R
+*/
+inline void mergedHoughLines(t_Accumulator& accumulator,
+vector<pair<size_t,size_t>>& hlines,//unordered_map<size_t, vector<size_t>>& hlines,
+const float_t threshold){
+for (int r = 0; r < accumulator.rows(); r++) {
+for (int t = 0; t < accumulator.cols(); t++) {
+//Is this point a local maxima (9x9)
+int max = accumulator(r,t);
+for(int ly=-4;ly<=4;ly++)
+{
+for(int lx=-4;lx<=4;lx++)
+{
+if( (ly+r>=0 && ly+r < accumulator.rows()) && (lx+t>=0 && lx+t<accumulator.cols()) )
+{
+if( (int)accumulator(r+ly,t+lx) > max )//( (r+ly)*accumulator.cols()) + (t+lx)] > max )
+{
+max =  accumulator(r+ly,t+lx);//_accu[( (r+ly)*_accu_w) + (t+lx)];
+ly = lx = 5;
+}
+}
+}
+}
+if(max > (int)accumulator(r,t))//_accu[(r*_accu_w) + t])
+continue;
+
+if (accumulator(r,t) > threshold){
+//hlines[r].push_back(t);
+hlines.push_back(make_pair(r, t));
+}
+}
+}
+}
+/*
+gets start and end of line and median of the angles from mergedLines with same R
+*/
+inline void uniqueLines(unordered_map<size_t, vector<size_t>>& mergedlines,
+t_houghLineVector& hlines,
+t_Accumulator& accu){
+for (unordered_map<size_t, vector<size_t>>::iterator i = mergedlines.begin();
+i != mergedlines.end();
+i++) {
+size_t tetha = static_cast<size_t>(median(i->second,false));
+float img_half_h = (float)_kernel_size * 0.5;
+float img_half_w = img_half_h;
+int x1, y1, x2, y2;
+x1 = y1 = x2 = y2 = 0;
+if(tetha >= 45 && tetha <= 135)
+{
+//y = (r - x cos(t)) / sin(t)
+x1 = 0;
+y1 = ((double)(i->first-((float)accu.rows()*0.5)) - ((x1 - (img_half_w) ) * cos(tetha * DEG2RAD))) / sin(tetha * DEG2RAD) + (img_half_h);
+x2 = (int)_kernel_size - 0;
+y2 = ((double)(i->first-((float)accu.rows()*0.5)) - ((x2 - (img_half_w) ) * cos(tetha * DEG2RAD))) / sin(tetha * DEG2RAD) + (img_half_h);
+}
+else
+{
+//x = (r - y sin(t)) / cos(t);
+y1 = 0;
+x1 = ((double)(i->first-((float)accu.rows()/2)) - ((y1 - (img_half_h) ) * sin(tetha * DEG2RAD))) / cos(tetha * DEG2RAD) + (img_half_w);
+y2 = (int)_kernel_size - 0;
+x2 = ((double)(i->first-((float)accu.rows()/2)) - ((y2 - (img_half_h) ) * sin(tetha * DEG2RAD))) / cos(tetha * DEG2RAD) + (img_half_w);
+}
+
+hlines.push_back(t_houghLine{
+t_point2d{static_cast<float_t>(x1),static_cast<float_t>(y1)},
+t_point2d{static_cast<float_t>(x2),static_cast<float_t>(y2)}
+});
+//cout << "R " << i->first << " T " << tetha << " LINE " << x1 << " " << y1 << " AND " << x2 << " " << y2 << endl;
+}
+}
+
+void getCartesian(t_Accumulator& accu,
+vector<pair<size_t,size_t>>& rtlines,
+t_houghLineVector& hlines){
+for (vector<pair<size_t,size_t>>::iterator i = rtlines.begin();
+i!=rtlines.end();
+i++) {
+size_t tetha = i->second;
+float img_half_h = (float)_kernel_size * 0.5;
+float img_half_w = img_half_h;
+int x1, y1, x2, y2;
+x1 = y1 = x2 = y2 = 0;
+if(tetha >= 45 && tetha <= 135)
+{
+//y = (r - x cos(t)) / sin(t)
+x1 = 0;
+y1 = ((double)(i->first-((float)accu.rows()*0.5)) - ((x1 - (img_half_w) ) * cos(tetha * DEG2RAD))) / sin(tetha * DEG2RAD) + (img_half_h);
+x2 = (int)_kernel_size - 0;
+y2 = ((double)(i->first-((float)accu.rows()*0.5)) - ((x2 - (img_half_w) ) * cos(tetha * DEG2RAD))) / sin(tetha * DEG2RAD) + (img_half_h);
+}
+else
+{
+//x = (r - y sin(t)) / cos(t);
+y1 = 0;
+x1 = ((double)(i->first-((float)accu.rows()/2)) - ((y1 - (img_half_h) ) * sin(tetha * DEG2RAD))) / cos(tetha * DEG2RAD) + (img_half_w);
+y2 = (int)_kernel_size - 0;
+x2 = ((double)(i->first-((float)accu.rows()/2)) - ((y2 - (img_half_h) ) * sin(tetha * DEG2RAD))) / cos(tetha * DEG2RAD) + (img_half_w);
+}
+
+hlines.push_back(t_houghLine{
+t_point2d{static_cast<float_t>(x1),static_cast<float_t>(y1)},
+t_point2d{static_cast<float_t>(x2),static_cast<float_t>(y2)}
+});
+//cout << "R " << i->first << " T " << tetha << " LINE " << x1 << " " << y1 << " AND " << x2 << " " << y2 << endl;
+}
+}
+
+void processRow(){
+RowState state;
+_buffer_mutex.lock();
+size_t offset = _buffer_offset;
+_buffer_offset += _buffer_length;
+state._row = _processed_row;
+_processed_row++;
+_buffer_mutex.unlock();
+if (offset + _buffer_length >= _image->Pixels.size()) return;
+
+unordered_map<size_t, vector<size_t>>   mergedHLines;
+//t_houghLineVector uniqueHLines;
+for (size_t i=0; i <= _bytes_per_row - _buffer_chunk_length; i += _buffer_chunk_length) {
+state._buffer_ptr = &_image->Pixels[i+offset];
+
+for (size_t y=0; y<_kernel_size; y++) {
+state._pixel_ptr = state._buffer_ptr;
+for (size_t x=0; x<_kernel_size; x++) {
+P pixel(state._pixel_ptr);
+state._components_sum = pixel.red;
+state._components_sum += pixel.green;
+state._components_sum += pixel.blue;
+
+if (state._components_sum <= _pixel_threshold){
+state._points.push_back(t_point2d{static_cast<float_t>(x),static_cast<float_t>(y)});
+//cout << "X ";
+}//else
+//cout << ". ";
+state._pixel_ptr += _bytes_per_pixel;
+}
+state._buffer_ptr += _bytes_per_row;
+//cout << endl;
+}
+//cout << state._points.size() << endl;
+/*
+if (state._points.size() > 1){
+
+cv::Mat m((int)_kernel_size,(int)_kernel_size,CV_8UC1,cv::Scalar(255,255,255));
+
+for(size_t i=0; i<state._points.size(); i++){
+m.at<unsigned char>(state._points[i].x(), state._points[i].y()) = 0;
+}
+vector<cv::Vec2f> lines;
+
+cv::HoughLines(m, lines, _line_length_threshold, 1*DEG2RAD, 20);
+cout << " FOUND " << lines.size() << endl;
+
+for (size_t i=0; i<lines.size(); i++) {
+cout << " LINE " << lines[i][0] << " " << lines[i][1] << endl;
+
+float rho = lines[i][0];
+float theta = lines[i][1];
+double a = cos(theta), b = sin(theta);
+double x0 = a*rho, y0 = b*rho;
+
+t_point2d pt1{
+(float_t)cvRound(x0 + _kernel_size*(-b)),
+(float_t)cvRound(y0 + _kernel_size*(a))
+};
+
+t_point2d pt2{
+(float_t)cvRound(x0 - _kernel_size*(-b)),
+(float_t)cvRound(y0 - _kernel_size*(a))
+};
+
+
+cout << pt1 << " AND " << pt2 << endl;
+t_houghLine hl{pt1,pt2};
+hl.region.row = state._row;
+hl.region.column = state._col;
+state._hlines.push_back(hl);
+
+}
+_data_set_mutex.lock();
+_data_set(state._row, state._col) = move(state._hlines);
+_data_set_mutex.unlock();
+}
+*/
+
+if (state._points.size() > 1){//> _min_density_threshold){// &&
+//state._points.size() < _max_density_threshold){
+/// get hough lines from this column
+this->houghLines(state._points,
+state._accumulator);
+vector<pair<size_t,size_t>> allhlines;
+/// merge by R and do median of angles and keep
+this->mergedHoughLines(state._accumulator,
+allhlines,
+_line_length_threshold);
+/*
+this->uniqueLines(mergedHLines,
+state._hlines,
+state._accumulator);
+*/
+
+this->getCartesian(state._accumulator,
+allhlines,
+state._hlines);
+for (size_t l = 0;
+l<state._hlines.size();
+l++){
+state._hlines[l].region.row = state._row;
+state._hlines[l].region.column = state._col;
+}
+
+_data_set_mutex.lock();
+_data_set(state._row, state._col) = move(state._hlines);
+_data_set_mutex.unlock();
+state._hlines.clear();
+mergedHLines.clear();
+if (this->shouldStop()){
+return;
+}
+}
+state._points.clear();
+state._col++;
+}
+}
+
+void processRows(){
+while(!done()){
+if (parallel_process<HoughLineDataSet<P>>::shouldStop()) break;
+processRow();
+}
+}
+
+public:
+
+template<class T>
+bool build(const size_t threads,
+T wait_timer){
+if (threads<= 1){
+processRows();
+}else{
+parallel_process<HoughLineDataSet<P>>::start(threads);
+}
+return true;
+}
+
+Eigen::Matrix<t_houghLineVector, Eigen::Dynamic, Eigen::Dynamic>*  get(){
+return &_data_set;
+}
+
+bool toVector(t_houghLineVector& outputLines){
+/// check if ready
+for (size_t i=0; i < _data_set.rows(); i++) {
+for (size_t j=0; j < _data_set.cols(); j++) {
+outputLines.insert(outputLines.end(), _data_set(i,j).begin(), _data_set(i,j).end());
+}
+}
+return true;
+}
+
+bool toImage(shared_ptr<Image> outputImage){
+
+outputImage->Format = PixelFormat::RGBA;
+outputImage->BitsPerComponent = 8;
+outputImage->BitsPerPixel = 32;
+outputImage->BytesPerPixel = 4;
+outputImage->Height = _kernel_size*_data_set.rows();
+outputImage->Width = _kernel_size*_data_set.cols();
+outputImage->BytesPerRow = outputImage->Width*outputImage->BytesPerPixel;
+outputImage->Pixels.resize(outputImage->BytesPerRow*outputImage->Height, 0xFF);
+
+t_houghLineVector lines;
+
+if (!toVector(lines))
+return false;
+
+cout << " THERE ARE " << lines.size() << endl;
+
+/// calculate absolute points
+size_t x = 0, y = 0, regionx = 0, regiony = 0;
+for (size_t i=0; i < lines.size(); i++) {
+regionx = (lines[i].region.column*_kernel_size);
+regiony = (lines[i].region.row*_kernel_size);
+//cout << " ORIGINALP1 " << lines[i].p1 << " AND " << lines[i].p2 << endl;
+x = regionx + lines[i].p1.x();
+y = regiony + lines[i].p1.y();
+//cout << " REGIONX " << regionx << " REGIONY " << regiony << endl;
+//cout << " ROW " << lines[i].region.row << " COLUMN " << lines[i].region.column << endl;
+//cout << " X " << x << " Y " << y << endl;
+lines[i].p1 = t_point2d{static_cast<float_t>(x),static_cast<float_t>(y)};
+x = regionx + lines[i].p2.x();
+y = regiony + lines[i].p2.y();
+//cout << " X " << x << " Y " << y << endl;
+lines[i].p2 = t_point2d{static_cast<float_t>(x),static_cast<float_t>(y)};
+
+//cout << " FINAL LINE " << lines[i].p1 << " " << lines[i].p2 << endl;
+}
+
+#if defined(__APPLE__) || defined(__MACH__)
+/// draw lines to image
+CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+CGBitmapInfo info = kCGImageAlphaNone;
+switch(outputImage->Format){
+case PixelFormat::ARGB:
+{
+info = kCGImageAlphaNoneSkipFirst;
+break;
+}
+case PixelFormat::RGBA:
+{
+info = kCGImageAlphaNoneSkipLast;
+break;
+}
+default:
+{
+CGColorSpaceRelease(colorSpace);
+return false;
+}
+}
+CGContextRef context = CGBitmapContextCreate(outputImage->Pixels.data(),
+outputImage->Width,
+outputImage->Height,
+outputImage->BitsPerComponent,
+outputImage->BytesPerRow,
+colorSpace, info);
+//CGContextBeginPath(context);
+CGFloat components[]{0,0,0,255};
+
+CGColorRef strokeColor =  CGColorCreate(colorSpace, components);//[_strokeColor CGColor];
+
+CGColorSpaceRelease(colorSpace);
+
+
+//CGColorRef fillColor = [UIColor redColor].CGColor;// [_bgColor CGColor];
+//CGContextSetFillColorWithColor(context, fillColor);
+CGContextBeginPath(context);
+
+CGContextSaveGState(context);
+CGContextTranslateCTM(context, 0, outputImage->Height);
+CGContextScaleCTM(context, 1.0, -1.0);
+//cout << " THERE ARE " << lines.size();
+for (size_t i=0; i < lines.size(); i++) {
+CGContextMoveToPoint(context, lines[i].p1.x() , lines[i].p1.y());
+CGContextAddLineToPoint(context, lines[i].p2.x(), lines[i].p2.y());
+//CGContextDrawPath(context, kCGPathFillStroke);
+}
+CGContextSetLineWidth(context, 1.0f);
+CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+CGContextSetFlatness(context, 1.0f);
+CGContextSetAllowsAntialiasing(context, false);
+CGContextSetShouldSmoothFonts(context,false);
+
+//CGContextSetLineCap(context, kCGLineCapSquare);
+//CGContextSetLineJoin(context, kCGLineJoinMiter);
+CGContextSetFillColorWithColor(context, strokeColor);
+CGContextSetStrokeColorWithColor(context, strokeColor);
+CGContextStrokePath(context);
+CGContextRestoreGState(context);
+//CGContextFlush(context);
+#endif
+
+return true;
+}
+
+HoughLineDataSet(shared_ptr<Image> image,
+const size_t kernel_size,
+float_t  line_length_threshold,
+float_t  min_density_threshold,
+float_t  max_density_threshold,
+size_t   pixel_threshold):
+_image(image),
+_kernel_size(kernel_size),
+_processed_row(0),
+parallel_process<HoughLineDataSet<P>>(bind(&HoughLineDataSet<P>::processRow,ref(*this)),
+bind(&HoughLineDataSet<P>::done,ref(*this))){
+_buffer_chunk_length = _kernel_size*_image->BytesPerPixel;
+_buffer_length = _image->BytesPerRow*_kernel_size;
+_bytes_per_pixel = _image->BytesPerPixel;
+_bytes_per_row = _image->BytesPerRow;
+_buffer_offset = 0;
+_line_length_threshold = line_length_threshold;
+_min_density_threshold = min_density_threshold;
+_max_density_threshold = max_density_threshold;
+_pixel_threshold  = pixel_threshold;
+_data_set.resize(_image->Height/_kernel_size,
+_image->Width/_kernel_size);
+}
+private:
+
+mutex                   _buffer_mutex;
+mutex                   _data_set_mutex;
+shared_ptr<Image>       _image;
+Eigen::Matrix<t_houghLineVector, Eigen::Dynamic, Eigen::Dynamic>           _data_set;
+size_t                  _processed_row;
+size_t                  _kernel_size;
+size_t                  _buffer_offset;
+size_t                  _buffer_length;
+size_t                  _buffer_chunk_length;
+size_t                  _bytes_per_pixel;
+size_t                  _bytes_per_row;
+size_t                  _pixel_threshold;
+size_t                  _min_density_threshold;
+size_t                  _max_density_threshold;
+float_t                 _line_length_threshold;
+};
+
+void houghLines (shared_ptr<Image>& image,
+Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic>& accumulator,
+uint32_t threshold){
+size_t csum, x = 0 , y = 0;
+float center_x = image->Width*0.5;
+float center_y = image->Height*0.5;
+
+float hough_h = ((sqrt(2.0) * (float)(image->Height>image->Width?image->Height:image->Width)) / 2.0),
+_accu_h = hough_h * 2.0, // -r -> +r
+_accu_w = 180;
+
+accumulator.resize(_accu_h, _accu_w);
+accumulator.setConstant(0);
+
+for (size_t i=0; i < image->Pixels.size(); i+= image->BytesPerPixel) {
+
+RGBA p(&image->Pixels[i]);
+csum = p.red;
+csum += p.green;
+csum += p.blue;
+if ( csum <= threshold ){
+for(int t=0;t<180;t++)
+{
+double r = ( ((float)x - center_x) * cos((float)t * DEG2RAD)) + (((float)y - center_y) * sin((float)t * DEG2RAD));
+accumulator(round(r+hough_h),t)++;
+}
+}
+if (x == image->Width){
+x = 0;
+y++;
+}
+x++;
+}
+}
+
+
+---------------------
+
+
+/*
+HoughLineDataSet<RGBA> hlds(Image::FromFile("/Volumes/External/toimg.jpg"),
+KERNEL_SIZE,
+5,
+KERNEL_SIZE*KERNEL_SIZE*0.07,
+KERNEL_SIZE*KERNEL_SIZE*0.40,
+0);
+
+START_CLOCK
+hlds.build(1, chrono::seconds(2000));
+STOP_CLOCK(microseconds,"hl")
+
+shared_ptr<Image> output_image(new Image);
+
+if (!hlds.toImage(output_image)){
+return false;
+}
+
+if (!output_image->ToJPEGFile("/Volumes/External/output_houghlines.jpg", PixelFormat::RGBA)){
+cout << "FAILED TO WRITE" << endl;
+}
+
+return 1;
+*/
+/*
+GetDistances();
+
+GetLengths();
+
+random_lines rl(KERNEL_SIZE, 3, 1, 3);
+
+shared_ptr<Image> img = Image::FromFile("/Volumes/External/a15.jpg");
+
+*/
+
+
+-----------------
+
+
+/*
+template<class D, class F>
+struct ParallelProcessor {
+template<typename... A>
+void operator()(const size_t threads,F& f,A... args){
+active_func = [&](A... _args){
+f(_args...);
+if (!static_cast<D*>(this)->done()){
+thread t(active_func,_args...);
+t.detach();
+threadVector.push_back(thread());
+threadVector.back().swap(t);
+}else{
+stop();
+}
+};
+for (int i=0;i<threads;i++){
+thread t(active_func,args...);t.detach();
+threadVector.push_back(thread());
+threadVector.back().swap(t);
+}
+}
+
+bool shouldStop(){
+lock_guard<mutex> lock(stoppedMutex);
+return stopped;
+}
+
+bool start(const size_t threads){
+if (user_func == nullptr)
+return false;
+(*this)(threads,user_func,ref(static_cast<D&>(*this)));
+return true;
+}
+void stop(){
+stopped = true;
+waitCondition.notify_all();
+for (size_t i=0; i<threadVector.size();i++){
+if (threadVector[i].joinable()){
+threadVector[i].join();
+}
+}
+}
+template<class T>
+std::cv_status wait(T t){
+unique_lock<mutex> ul(waitMutex);
+return waitCondition.wait_for(ul, t);
+}
+explicit ParallelProcessor(){
+user_func = &D::worker;
+}
+/// TODO store threads and stop at timeout
+protected:
+vector<thread>                              threadVector;
+condition_variable                          waitCondition;
+mutex                                       waitMutex;
+F                                           active_func;
+F                                           user_func;
+mutex                                       stoppedMutex;
+bool                                        stopped;
+};
+*/
+
+
+
+-----------------------------
+
+
+
+template<class DataContainer, class Linkage>
+void AGGH(typename DataContainer::const_iterator start,
+typename DataContainer::const_iterator end,
+std::function<void(std::vector<size_t>&,
+Eigen::Matrix<typename DataContainer::value_type::hierarchical_distance_type, Eigen::Dynamic, Eigen::Dynamic>&,
+typename DataContainer::value_type::hierarchical_distance_type)> clustersChanged
+){
+
+typedef typename DataContainer::const_iterator                                      data_iterator;
+typedef typename DataContainer::value_type::hierarchical_distance_type              DistanceType;
+typedef typename DataContainer::value_type::hierarchical_infinity_type              InfinityType;
+typedef typename Eigen::Matrix<DistanceType, Eigen::Dynamic, Eigen::Dynamic>        DistanceMatrixType;
+
+//    Algorithm(on object indexes) :
+//    1. compute initial distances and initial clusters
+//    2. repeat until all clusters merged into one(a cluster can contain a single object)
+//        3. get indexes that need to be merged by looking up distance matrix with linkage
+//        4. get indexes that will be clustered and that won't be clustered
+//        5. remove and add rows/columns to distance matrix and compute distances between new clusters(non clustered indexes) with linkage
+size_t                                      size = distance(start, end);
+DistanceType                                infinity = InfinityType().value();
+DistanceMatrixType                          distance_matrix(size,size);
+distance_matrix.setConstant(infinity);
+size_t                                      ii = 0, jj = 0;
+Linkage                                     linkage(infinity);
+vector<vector<size_t>>                      merged_objects(size);
+array<size_t, 2>                            indexes_to_merge;
+// 1.
+for ( data_iterator i = start; i!= end; i++, ii++){
+for ( data_iterator j= start; j != end; ++j, jj++){
+if ( ii == size )
+ii=0;
+if ( jj == size )
+jj=0;
+/// These will be predefined usually to infinity
+if ( ii == jj ) continue;
+DistanceType distance = (*i)-(*j);
+distance_matrix(ii,jj) = distance;
+distance_matrix(jj,ii) = distance;
+}
+merged_objects[ii].push_back(ii);
+}
+//cout << distance_matrix << endl;
+/// temporary
+vector<size_t>          merged;
+vector<size_t>          not_clustered;
+vector<vector<size_t>>  temp_clustered;
+DistanceMatrixType      temp_matrix(distance_matrix.cols(),distance_matrix.rows());
+/// 2.
+while ( size > 1 ) {
+///reset linkage
+linkage.Value(infinity);
+/// 3.
+for (size_t i=0; i < distance_matrix.cols(); i++) {
+for (size_t j=0; j < distance_matrix.rows(); j++) {
+if ( i == j ) continue;
+if (linkage(distance_matrix(i,j))){
+indexes_to_merge[0] = i;
+indexes_to_merge[1] = j;
+}
+}
+}
+//cout << " INDEX 0 : " << indexes_to_merge[0] << " " << indexes_to_merge[1] << endl;
+merged.clear();
+not_clustered.clear();
+/// 4.
+for (int i=0 ; i < merged_objects[indexes_to_merge[0]].size(); i++) {
+merged.push_back(merged_objects[indexes_to_merge[0]][i]);
+}
+for (int i=0; i < merged_objects[indexes_to_merge[1]].size(); i++) {
+merged.push_back(merged_objects[indexes_to_merge[1]][i]);
+}
+
+for (int i=0; i < merged_objects.size(); i++) {
+if ( indexes_to_merge[0] != i && indexes_to_merge[1] != i ){
+temp_clustered.push_back(merged_objects[i]);
+not_clustered.push_back(i);
+}
+}
+temp_clustered.push_back(merged);//// CHANGED
+clustersChanged(merged,distance_matrix,linkage.Value());
+temp_matrix = distance_matrix;
+/// remove rows and columns
+/// copy rows and cols
+//cout << endl <<temp_matrix << endl;
+//cout << " Removing : " << indexes_to_merge[0] << "  " << indexes_to_merge[1] << endl;
+removeColumn(temp_matrix, indexes_to_merge[0]);
+//cout << endl << temp_matrix << endl;
+removeRow(temp_matrix, indexes_to_merge[0]);
+//cout << endl << temp_matrix << endl;
+removeColumn(temp_matrix, indexes_to_merge[1]-1);
+//cout << endl << temp_matrix << endl;
+
+removeRow(temp_matrix, indexes_to_merge[1]-1);
+//cout << endl << temp_matrix << endl;
+temp_matrix.conservativeResize(temp_matrix.rows()+1, temp_matrix.cols()+1);
+//cout << endl << temp_matrix << endl;
+
+for (size_t i =0; i<not_clustered.size(); i++) {
+linkage.Value(infinity);
+linkage(distance_matrix(not_clustered[i],indexes_to_merge[0]));
+linkage(distance_matrix(not_clustered[i],indexes_to_merge[1]));
+temp_matrix(i,size-2) = linkage.Value();
+temp_matrix(size-2,i) = linkage.Value();
+}
+
+//cout << endl << temp_matrix << endl;
+distance_matrix = move(temp_matrix);
+merged_objects = temp_clustered;
+temp_clustered.clear();
+size--;
+}
+
+return;
+}
+
